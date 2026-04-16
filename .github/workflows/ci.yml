@@ -29,9 +29,9 @@ jobs:
     - name: Lint with ruff (notebooks ignored)
       run: ruff check . --ignore=E501
 
-    - name: Quick inference smoke test (uses joblib - no training!)
+    - name: Quick inference smoke test (joblib + Python 3.14)
       run: |
-        python -c
+        python - <<EOF
         import joblib
         import os
 
@@ -56,3 +56,4 @@ jobs:
             print("But CI will still pass if this is the only issue")
 
         print("CI smoke test passed! 🚀")
+        EOF
