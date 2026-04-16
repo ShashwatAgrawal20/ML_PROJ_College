@@ -31,29 +31,28 @@ jobs:
 
     - name: Quick inference smoke test (uses joblib - no training!)
       run: |
-        python -c '
-import joblib
-import os
+        python -c
+        import joblib
+        import os
 
-print("✅ Checking model files...")
-models = [f for f in os.listdir(".") if f.endswith((".pkl", ".joblib", ".keras"))]
-print("Found models:", models)
+        print("✅ Checking model files...")
+        models = [f for f in os.listdir(".") if f.endswith((".pkl", ".joblib", ".keras"))]
+        print("Found models:", models)
 
-try:
-    train_cols = joblib.load("train_cols.pkl")
-    scaler = joblib.load("scaler.pkl")
-    dt_model = joblib.load("decision_tree_model.pkl")
+        try:
+            train_cols = joblib.load("train_cols.pkl")
+            scaler = joblib.load("scaler.pkl")
+            dt_model = joblib.load("decision_tree_model.pkl")
 
-    print("✅ train_cols.pkl loaded")
-    print("✅ scaler.pkl loaded")
-    print("✅ decision_tree_model.pkl loaded")
-    print("All core models and artifacts load successfully! ✅")
+            print("✅ train_cols.pkl loaded")
+            print("✅ scaler.pkl loaded")
+            print("✅ decision_tree_model.pkl loaded")
+            print("All core models and artifacts load successfully! ✅")
 
-except FileNotFoundError:
-    print("⚠️ Some models missing (normal on fresh clone - first training needed)")
-except Exception as e:
-    print(f"⚠️ Unexpected load error: {e}")
-    print("But CI will still pass if this is the only issue")
+        except FileNotFoundError:
+            print("⚠️ Some models missing (normal on fresh clone - first training needed)")
+        except Exception as e:
+            print(f"⚠️ Unexpected load error: {e}")
+            print("But CI will still pass if this is the only issue")
 
-print("CI smoke test passed! 🚀")
-        '
+        print("CI smoke test passed! 🚀")
