@@ -10,7 +10,6 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from rich.console import Console
 from rich.progress import Progress
-import numpy as np
 
 # Suppress warnings
 import warnings

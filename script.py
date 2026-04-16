@@ -273,7 +273,7 @@ def prediction_cli():
         ensemble = joblib.load("ensemble_voting_model.pkl")
         models["Ensemble (Voting)"] = ensemble
         console.log("[green]Ensemble model loaded successfully![/green]")
-    except:
+    except FileNotFoundError:
         console.log(
             "[yellow]Ensemble model not found, fitting it now (one-time process)...[/yellow]")
         # Need to load training data to fit ensemble
@@ -294,6 +294,7 @@ def prediction_cli():
                                names=columns, header=None)
             data['outcome'] = data['outcome'].apply(
                 lambda x: 0 if x == 'normal' else 1)
+            train_cols = joblib.load('train_cols.pkl')
             processed_data = preprocess(data, is_train=False)
             X = processed_data[train_cols]
             y = processed_data['outcome']

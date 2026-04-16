@@ -1,0 +1,6 @@
+[lint]
+select = ["F", "E"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+"*.ipynb" = ["F401", "F811", "F821"]
