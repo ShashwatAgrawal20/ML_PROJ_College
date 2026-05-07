@@ -28,28 +28,42 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'YOUR_API_KEY_HERE')
 
 def init_gemini():
     """Initialize Gemini API with gemini-3-flash-preview model."""
+    if not GEMINI_API_KEY:
+        return None
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         model_name = "gemini-3-flash-preview"
-        console.print(f"[cyan]Initializing Gemini model: {model_name}[/cyan]")
-        return genai.GenerativeModel(model_name)
+        # Test model availability with a lightweight call
+        model = genai.GenerativeModel(model_name)
+        model.generate_content("Test", generation_config={"max_output_tokens": 10})
+        console.print(f"[green]Successfully initialized Gemini model: {model_name}[/green]")
+        return model
     except Exception as e:
         console.print(f"[yellow]Gemini API init failed: {e}[/yellow]")
         return None
 
 
-def explain_prediction_with_ai(model, scenario_desc, prediction, confidence, traffic_data):
+def explain_prediction_with_ai(model, scenario_desc, prediction, confidence, traffic_data, model_predictions=None):
     """Use Gemini API to explain the detection result in plain English."""
     try:
         if model is None:
             return "AI explanation unavailable (API not configured)."
+
+        # Build model disagreement info
+        disagreement_info = ""
+        if model_predictions:
+            attack_votes = sum(1 for p in model_predictions.values() if p == 1)
+            total = len(model_predictions)
+            disagreement_info = f"\nModel votes: {attack_votes}/{total} predicted attack"
+            if attack_votes > 0 and attack_votes < total:
+                disagreement_info += "\nModels disagree - some detect attack, others see normal traffic."
 
         prompt = f"""
 You are a cybersecurity expert analyzing network intrusion detection results.
 
 Scenario: {scenario_desc}
 Prediction: {"ATTACK detected" if prediction == 1 else "Normal traffic"}
-Confidence: {confidence:.2%}
+Confidence: {confidence:.2%}{disagreement_info}
 
 Key traffic features:
 - Protocol: {traffic_data.get('protocol_type', 'N/A')}
@@ -60,15 +74,72 @@ Key traffic features:
 - Error rates: serror={traffic_data.get('serror_rate', 0):.2f}, rerror={traffic_data.get('rerror_rate', 0):.2f}
 - Count: {traffic_data.get('count', 'N/A')}
 
-Explain in 3-4 sentences:
-1. What this traffic pattern indicates
-2. Why the model made this prediction
-3. What action should be taken
+Provide a concise analysis (3-4 sentences):
+1. What this traffic pattern indicates and why it's classified this way
+2. The likely attack type (if attack) or why it's benign
+3. Recommended immediate action
 """
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
         return f"AI explanation error: {e}"
+
+
+def ask_ai_followup(model, question, context):
+    """Allow user to ask follow-up questions about the detection."""
+    try:
+        prompt = f"""
+You are a cybersecurity expert. Based on this network traffic analysis context:
+
+{context}
+
+User question: {question}
+
+Provide a clear, technical answer in 2-3 sentences.
+"""
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def generate_traffic_from_description(model, description):
+    """Use Gemini to generate NSL-KDD feature values from a plain English description."""
+    try:
+        prompt = f"""
+You are a network security expert. Generate realistic NSL-KDD dataset feature values for this traffic scenario:
+
+"{description}"
+
+Return ONLY a Python dictionary with these exact keys (no extra text, no markdown):
+'duration', 'protocol_type', 'service', 'flag', 'src_bytes', 'dst_bytes', 'land', 'wrong_fragment', 'urgent', 'hot', 'num_failed_logins', 'logged_in', 'num_compromised', 'root_shell', 'su_attempted', 'num_root', 'num_file_creations', 'num_shells', 'num_access_files', 'num_outbound_cmds', 'is_host_login', 'is_guest_login', 'count', 'srv_count', 'serror_rate', 'srv_serror_rate', 'rerror_rate', 'srv_rerror_rate', 'same_srv_rate', 'diff_srv_rate', 'srv_diff_host_rate', 'dst_host_count', 'dst_host_srv_count', 'dst_host_same_srv_rate', 'dst_host_diff_srv_rate', 'dst_host_same_src_port_rate', 'dst_host_srv_diff_host_rate', 'dst_host_serror_rate', 'dst_host_srv_serror_rate', 'dst_host_rerror_rate', 'dst_host_srv_rerror_rate'
+
+Guidelines:
+- protocol_type: 'tcp', 'udp', or 'icmp'
+- service: 'http', 'ftp', 'smtp', 'ssh', 'dns', 'ecr_i', 'private', etc.
+- flag: 'SF' (normal), 'S0' (SYN flood), 'REJ' (rejected), etc.
+- For attacks: set appropriate error rates (serror_rate=1.0 for SYN flood), high count values
+- For normal traffic: low error rates, 'SF' flag, reasonable byte values
+- land, wrong_fragment, urgent, hot, num_compromised, root_shell, su_attempted, num_root, num_file_creations, num_shells, num_access_files, num_outbound_cmds, is_host_login, is_guest_login: use 0 or 1
+- All rates should be between 0.0 and 1.0
+- src_bytes and dst_bytes: positive integers
+"""
+        response = model.generate_content(prompt)
+        # Extract dictionary from response
+        import re
+        text = response.text.strip()
+        # Find dict-like pattern
+        match = re.search(r'\{[^}]+\}', text, re.DOTALL)
+        if match:
+            dict_str = match.group(0)
+            # Safely evaluate the dictionary
+            traffic_dict = eval(dict_str)
+            return traffic_dict
+        else:
+            raise ValueError("Could not parse Gemini response")
+    except Exception as e:
+        console.print(f"[yellow]Error generating traffic: {e}[/yellow]")
+        return None
 
 
 def preprocess(dataframe, is_train=True):
@@ -306,10 +377,86 @@ def train_and_evaluate(data_path):
         "[bold green]All models trained and saved successfully![/bold green]")
 
 
+def analyze_traffic(test_df, models, gemini_model, scenario_desc, train_cols, traffic_data=None):
+    """Analyze traffic and display results with optional AI explanation."""
+    processed_test_df = preprocess(test_df, is_train=False)
+    processed_test_df = processed_test_df.reindex(columns=train_cols, fill_value=0)
+
+    table = Table(title=f"🔍 Detection Results for {scenario_desc}",
+                  title_style="bold magenta", show_header=True, header_style="bold cyan")
+    table.add_column("Model", style="cyan", no_wrap=True, width=25)
+    table.add_column("Prediction", style="magenta", width=15)
+    table.add_column("Confidence", style="yellow", width=12)
+    table.add_column("Risk Level", style="white", width=15)
+
+    predictions_list = []
+    model_prediction_details = {}
+
+    for name, model in models.items():
+        probs = model.predict_proba(processed_test_df)[0]
+        prediction = np.argmax(probs)
+        confidence = probs[prediction]
+        predictions_list.append(prediction)
+        model_prediction_details[name] = {"pred": prediction, "conf": confidence}
+
+        label = "🚨 Attack" if prediction == 1 else "✅ Normal"
+        style = "bold red" if prediction == 1 else "bold green"
+        confidence_str = f"{confidence:.2%}"
+
+        if prediction == 1:
+            risk = "🔴 Critical" if confidence > 0.9 else "🟠 High" if confidence > 0.7 else "🟡 Medium"
+        else:
+            risk = "🟢 Safe"
+
+        table.add_row(name, f"[{style}]{label}[/{style}]", confidence_str, risk)
+
+    console.print(table)
+
+    attack_count = sum(predictions_list)
+    consensus = attack_count / len(predictions_list)
+
+    console.print("\n" + "="*60)
+    if consensus >= 0.6:
+        console.print(Panel(
+            f"[bold red]✅ THREAT DETECTED![/bold red]\n"
+            f"Consensus: {attack_count}/{len(predictions_list)} models detected an attack\n"
+            f"Confidence: {consensus*100:.1f}%\n"
+            f"Recommendation: Block traffic and investigate immediately",
+            style="bold white on red"))
+    else:
+        console.print(Panel(
+            f"[bold green]✅ TRAFFIC APPEARS NORMAL[/bold green]\n"
+            f"Consensus: {len(predictions_list)-attack_count}/{len(predictions_list)} models approve\n"
+            f"Confidence: {(1-consensus)*100:.1f}%\n"
+            f"Recommendation: Allow traffic, continue monitoring",
+            style="bold white on green"))
+
+    if gemini_model:
+        overall_pred = 1 if consensus >= 0.6 else 0
+        avg_conf = consensus if overall_pred == 1 else (1 - consensus)
+        console.print("\n[bold cyan]🤖 AI Analysis (Gemini):[/bold cyan]")
+        with console.status("[cyan]Getting AI explanation...[/cyan]"):
+            explanation = explain_prediction_with_ai(
+                gemini_model, scenario_desc, overall_pred, avg_conf,
+                traffic_data or {}, model_prediction_details)
+        console.print(Panel(explanation, title="AI Security Analyst", border_style="magenta"))
+
+        context = f"Scenario: {scenario_desc}\nPrediction: {'Attack' if overall_pred == 1 else 'Normal'}\nConfidence: {avg_conf:.2%}"
+        while True:
+            console.print("\n[dim]Ask AI a follow-up question (or press Enter to continue):[/dim]")
+            q = input("> ").strip()
+            if not q:
+                break
+            with console.status("[cyan]AI thinking...[/cyan]"):
+                answer = ask_ai_followup(gemini_model, q, context)
+            console.print(f"[magenta]AI:[/magenta] {answer}")
+
+    console.print("="*60 + "\n")
+
+
 def prediction_cli():
     """Interactive CLI with ensemble predictions and confidence analysis."""
-    console.log(
-        "[bold cyan]Loading models and preprocessors for prediction...[/bold cyan]")
+    console.log("[bold cyan]Loading models and preprocessors for prediction...[/bold cyan]")
 
     gemini_model = init_gemini()
     if gemini_model:
@@ -329,91 +476,62 @@ def prediction_cli():
         models["Ensemble (Voting)"] = ensemble
         console.log("[green]Ensemble model loaded successfully![/green]")
     except FileNotFoundError:
-        console.log(
-            "[yellow]Ensemble model not found, fitting it now (one-time process)...[/yellow]")
-        # Need to load training data to fit ensemble
+        console.log("[yellow]Ensemble model not found, fitting it now...[/yellow]")
         try:
-            columns = [
-                'duration', 'protocol_type', 'service', 'flag', 'src_bytes', 'dst_bytes', 'land',
-                'wrong_fragment', 'urgent', 'hot', 'num_failed_logins', 'logged_in',
-                'num_compromised', 'root_shell', 'su_attempted', 'num_root', 'num_file_creations',
-                'num_shells', 'num_access_files', 'num_outbound_cmds', 'is_host_login',
-                'is_guest_login', 'count', 'srv_count', 'serror_rate', 'srv_serror_rate',
-                'rerror_rate', 'srv_rerror_rate', 'same_srv_rate', 'diff_srv_rate',
-                'srv_diff_host_rate', 'dst_host_count', 'dst_host_srv_count',
-                'dst_host_same_srv_rate', 'dst_host_diff_srv_rate', 'dst_host_same_src_port_rate',
-                'dst_host_srv_diff_host_rate', 'dst_host_serror_rate', 'dst_host_srv_serror_rate',
-                'dst_host_rerror_rate', 'dst_host_srv_rerror_rate', 'outcome', 'level'
-            ]
-            data = pd.read_csv("nsl-kdd/KDDTrain+.txt",
-                               names=columns, header=None)
-            data['outcome'] = data['outcome'].apply(
-                lambda x: 0 if x == 'normal' else 1)
+            columns = ['duration', 'protocol_type', 'service', 'flag', 'src_bytes', 'dst_bytes', 'land',
+                       'wrong_fragment', 'urgent', 'hot', 'num_failed_logins', 'logged_in',
+                       'num_compromised', 'root_shell', 'su_attempted', 'num_root', 'num_file_creations',
+                       'num_shells', 'num_access_files', 'num_outbound_cmds', 'is_host_login',
+                       'is_guest_login', 'count', 'srv_count', 'serror_rate', 'srv_serror_rate',
+                       'rerror_rate', 'srv_rerror_rate', 'same_srv_rate', 'diff_srv_rate',
+                       'srv_diff_host_rate', 'dst_host_count', 'dst_host_srv_count',
+                       'dst_host_same_srv_rate', 'dst_host_diff_srv_rate', 'dst_host_same_src_port_rate',
+                       'dst_host_srv_diff_host_rate', 'dst_host_serror_rate', 'dst_host_srv_serror_rate',
+                       'dst_host_rerror_rate', 'dst_host_srv_rerror_rate', 'outcome', 'level']
+            data = pd.read_csv("nsl-kdd/KDDTrain+.txt", names=columns, header=None)
+            data['outcome'] = data['outcome'].apply(lambda x: 0 if x == 'normal' else 1)
             train_cols = joblib.load('train_cols.pkl')
             processed_data = preprocess(data, is_train=False)
             X = processed_data[train_cols]
             y = processed_data['outcome']
-
-            # Sample data for faster fitting (use 10% of data)
             sample_size = min(5000, len(X))
             indices = np.random.choice(len(X), sample_size, replace=False)
-            X_sample = X.iloc[indices]
-            y_sample = y.iloc[indices]
-
             ensemble = create_ensemble_model(models)
-            console.log(
-                "[cyan]Fitting ensemble model on sample data...[/cyan]")
-            ensemble.fit(X_sample, y_sample)
+            ensemble.fit(X.iloc[indices], y.iloc[indices])
             joblib.dump(ensemble, "ensemble_voting_model.pkl")
             models["Ensemble (Voting)"] = ensemble
             console.log("[green]Ensemble fitted and saved![/green]")
         except Exception as e:
             console.log(f"[red]Could not fit ensemble: {e}[/red]")
-            console.log(
-                "[yellow]Continuing without ensemble model...[/yellow]")
 
     train_cols = joblib.load('train_cols.pkl')
 
     predefined_data = [
-        {'duration': 0, 'protocol_type': 'tcp', 'service': 'http', 'flag': 'SF', 'src_bytes': 300, 'dst_bytes': 2500, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 1, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 4, 'srv_count': 4, 'serror_rate': 0.0,
-            'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 150, 'dst_host_srv_count': 255, 'dst_host_same_srv_rate': 1.0, 'dst_host_diff_srv_rate': 0.0, 'dst_host_same_src_port_rate': 0.01, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0},
-        {'duration': 2, 'protocol_type': 'tcp', 'service': 'ftp_data', 'flag': 'SF', 'src_bytes': 1500, 'dst_bytes': 0, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 1, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 1, 'srv_count': 1, 'serror_rate': 0.0,
-            'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 20, 'dst_host_srv_count': 30, 'dst_host_same_srv_rate': 0.5, 'dst_host_diff_srv_rate': 0.1, 'dst_host_same_src_port_rate': 1.0, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0},
-        {'duration': 0, 'protocol_type': 'tcp', 'service': 'private', 'flag': 'S0', 'src_bytes': 0, 'dst_bytes': 0, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 0, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 200, 'srv_count': 10, 'serror_rate': 1.00,
-            'srv_serror_rate': 1.00, 'rerror_rate': 0.00, 'srv_rerror_rate': 0.00, 'same_srv_rate': 0.05, 'diff_srv_rate': 0.06, 'srv_diff_host_rate': 0.00, 'dst_host_count': 255, 'dst_host_srv_count': 10, 'dst_host_same_srv_rate': 0.04, 'dst_host_diff_srv_rate': 0.06, 'dst_host_same_src_port_rate': 0.00, 'dst_host_srv_diff_host_rate': 0.00, 'dst_host_serror_rate': 1.00, 'dst_host_srv_serror_rate': 1.00, 'dst_host_rerror_rate': 0.00, 'dst_host_srv_rerror_rate': 0.00},
-        {'duration': 0, 'protocol_type': 'tcp', 'service': 'eco_i', 'flag': 'SF', 'src_bytes': 8, 'dst_bytes': 0, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 0, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 500, 'srv_count': 500, 'serror_rate': 0.0,
-            'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 255, 'dst_host_srv_count': 200, 'dst_host_same_srv_rate': 0.8, 'dst_host_diff_srv_rate': 0.1, 'dst_host_same_src_port_rate': 0.8, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0},
-        {'duration': 4, 'protocol_type': 'tcp', 'service': 'ftp', 'flag': 'SF', 'src_bytes': 150, 'dst_bytes': 200, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 3, 'num_failed_logins': 5, 'logged_in': 0, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 1, 'count': 1, 'srv_count': 1, 'serror_rate': 0.0,
-            'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 10, 'dst_host_srv_count': 2, 'dst_host_same_srv_rate': 0.2, 'dst_host_diff_srv_rate': 0.8, 'dst_host_same_src_port_rate': 1.0, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0},
-        {'duration': 0, 'protocol_type': 'icmp', 'service': 'ecr_i', 'flag': 'SF', 'src_bytes': 1032, 'dst_bytes': 0, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 0, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 511, 'srv_count': 511, 'serror_rate': 0.0,
-            'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 255, 'dst_host_srv_count': 255, 'dst_host_same_srv_rate': 1.0, 'dst_host_diff_srv_rate': 0.0, 'dst_host_same_src_port_rate': 1.0, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0}
+        {'duration': 0, 'protocol_type': 'tcp', 'service': 'http', 'flag': 'SF', 'src_bytes': 300, 'dst_bytes': 2500, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 1, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 4, 'srv_count': 4, 'serror_rate': 0.0, 'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 150, 'dst_host_srv_count': 255, 'dst_host_same_srv_rate': 1.0, 'dst_host_diff_srv_rate': 0.0, 'dst_host_same_src_port_rate': 0.01, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0},
+        {'duration': 2, 'protocol_type': 'tcp', 'service': 'ftp_data', 'flag': 'SF', 'src_bytes': 1500, 'dst_bytes': 0, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 1, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 1, 'srv_count': 1, 'serror_rate': 0.0, 'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 20, 'dst_host_srv_count': 30, 'dst_host_same_srv_rate': 0.5, 'dst_host_diff_srv_rate': 0.1, 'dst_host_same_src_port_rate': 1.0, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0},
+        {'duration': 0, 'protocol_type': 'tcp', 'service': 'private', 'flag': 'S0', 'src_bytes': 0, 'dst_bytes': 0, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 0, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 200, 'srv_count': 10, 'serror_rate': 1.00, 'srv_serror_rate': 1.00, 'rerror_rate': 0.00, 'srv_rerror_rate': 0.00, 'same_srv_rate': 0.05, 'diff_srv_rate': 0.06, 'srv_diff_host_rate': 0.00, 'dst_host_count': 255, 'dst_host_srv_count': 10, 'dst_host_same_srv_rate': 0.04, 'dst_host_diff_srv_rate': 0.06, 'dst_host_same_src_port_rate': 0.00, 'dst_host_srv_diff_host_rate': 0.00, 'dst_host_serror_rate': 1.00, 'dst_host_srv_serror_rate': 1.00, 'dst_host_rerror_rate': 0.00, 'dst_host_srv_rerror_rate': 0.00},
+        {'duration': 0, 'protocol_type': 'tcp', 'service': 'eco_i', 'flag': 'SF', 'src_bytes': 8, 'dst_bytes': 0, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 0, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 500, 'srv_count': 500, 'serror_rate': 0.0, 'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 255, 'dst_host_srv_count': 200, 'dst_host_same_srv_rate': 0.8, 'dst_host_diff_srv_rate': 0.1, 'dst_host_same_src_port_rate': 0.8, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0},
+        {'duration': 4, 'protocol_type': 'tcp', 'service': 'ftp', 'flag': 'SF', 'src_bytes': 150, 'dst_bytes': 200, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 3, 'num_failed_logins': 5, 'logged_in': 0, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 1, 'count': 1, 'srv_count': 1, 'serror_rate': 0.0, 'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 10, 'dst_host_srv_count': 2, 'dst_host_same_srv_rate': 0.2, 'dst_host_diff_srv_rate': 0.8, 'dst_host_same_src_port_rate': 1.0, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0},
+        {'duration': 0, 'protocol_type': 'icmp', 'service': 'ecr_i', 'flag': 'SF', 'src_bytes': 1032, 'dst_bytes': 0, 'land': 0, 'wrong_fragment': 0, 'urgent': 0, 'hot': 0, 'num_failed_logins': 0, 'logged_in': 0, 'num_compromised': 0, 'root_shell': 0, 'su_attempted': 0, 'num_root': 0, 'num_file_creations': 0, 'num_shells': 0, 'num_access_files': 0, 'num_outbound_cmds': 0, 'is_host_login': 0, 'is_guest_login': 0, 'count': 511, 'srv_count': 511, 'serror_rate': 0.0, 'srv_serror_rate': 0.0, 'rerror_rate': 0.0, 'srv_rerror_rate': 0.0, 'same_srv_rate': 1.0, 'diff_srv_rate': 0.0, 'srv_diff_host_rate': 0.0, 'dst_host_count': 255, 'dst_host_srv_count': 255, 'dst_host_same_srv_rate': 1.0, 'dst_host_diff_srv_rate': 0.0, 'dst_host_same_src_port_rate': 1.0, 'dst_host_srv_diff_host_rate': 0.0, 'dst_host_serror_rate': 0.0, 'dst_host_srv_serror_rate': 0.0, 'dst_host_rerror_rate': 0.0, 'dst_host_srv_rerror_rate': 0.0}
     ]
 
     scenario_descriptions = [
-        "Normal HTTP Traffic (Benign)",
-        "Normal FTP Traffic (Benign)",
-        "SYN Flood DoS Attack",
-        "Port Scan / Nmap Probe",
-        "FTP Brute Force Attack",
-        "ICMP Smurf Attack (DoS)"
+        "Normal HTTP Traffic (Benign)", "Normal FTP Traffic (Benign)", "SYN Flood DoS Attack",
+        "Port Scan / Nmap Probe", "FTP Brute Force Attack", "ICMP Smurf Attack (DoS)"
     ]
 
     while True:
         console.print("\n" + "="*60)
-        console.print(Panel("[bold cyan]Enhanced IDS - Intrusion Detection with Ensemble AI[/bold cyan]",
-                            style="bold white on blue"))
+        console.print(Panel("[bold cyan]Enhanced IDS - Intrusion Detection with Ensemble AI[/bold cyan]", style="bold white on blue"))
         console.print("="*60)
-        console.print(
-            f"[yellow]Select a network traffic scenario (1-{len(predefined_data)}):[/yellow]")
-
         for i, desc in enumerate(scenario_descriptions, 1):
             color = "green" if i <= 2 else "red"
             console.print(f"  [{color}]{i}. {desc}[/{color}]")
-
+        console.print(f"\n  [cyan]{len(predefined_data)+1}. Custom traffic input[/cyan]")
         console.print("\n  [cyan]0. Exit[/cyan]")
         console.print("="*60)
 
-        user_input = input("Your choice: ")
+        user_input = input("Your choice: ").strip()
         try:
             choice = int(user_input)
         except ValueError:
@@ -421,99 +539,41 @@ def prediction_cli():
             continue
 
         if choice == 0:
-            console.log(
-                "[bold cyan]Exiting Enhanced IDS. Stay safe![/bold cyan]")
+            console.log("[bold cyan]Exiting Enhanced IDS. Stay safe![/bold cyan]")
             break
 
-        if 1 <= choice <= len(predefined_data):
-            console.log(f"[cyan]Analyzing scenario {choice}: {
-                        scenario_descriptions[choice-1]}...[/cyan]")
-            test_df = pd.DataFrame([predefined_data[choice - 1]])
-            processed_test_df = preprocess(test_df, is_train=False)
-            processed_test_df = processed_test_df.reindex(
-                columns=train_cols, fill_value=0)
-
-            table = Table(title=f"🔍 Detection Results for Scenario {choice}",
-                          title_style="bold magenta",
-                          show_header=True,
-                          header_style="bold cyan")
-            table.add_column("Model", style="cyan", no_wrap=True, width=25)
-            table.add_column("Prediction", style="magenta", width=15)
-            table.add_column("Confidence", style="yellow", width=12)
-            table.add_column("Risk Level", style="white", width=15)
-
-            predictions_list = []
-
-            for name, model in models.items():
-                probs = model.predict_proba(processed_test_df)[0]
-                prediction = np.argmax(probs)
-                confidence = probs[prediction]
-                predictions_list.append(prediction)
-
-                label = "🚨 Attack" if prediction == 1 else "✅ Normal"
-                style = "bold red" if prediction == 1 else "bold green"
-                confidence_str = f"{confidence:.2%}"
-
-                # Risk level based on confidence
-                if prediction == 1:
-                    if confidence > 0.9:
-                        risk = "🔴 Critical"
-                    elif confidence > 0.7:
-                        risk = "🟠 High"
-                    else:
-                        risk = "🟡 Medium"
-                else:
-                    risk = "🟢 Safe"
-
-                table.add_row(name, f"[{style}]{
-                              label}[/{style}]", confidence_str, risk)
-
-            console.print(table)
-
-            # Consensus analysis
-            attack_count = sum(predictions_list)
-            consensus = attack_count / len(predictions_list)
-
-            console.print("\n" + "="*60)
-            if consensus >= 0.6:
-                console.print(Panel(
-                    f"[bold red]✅ THREAT DETECTED![/bold red]\n"
-                    f"Consensus: {
-                        attack_count}/{len(predictions_list)} models detected an attack\n"
-                    f"Confidence: {consensus*100:.1f}%\n"
-                    f"Recommendation: Block traffic and investigate immediately",
-                    style="bold white on red"
-                ))
+        elif choice == len(predefined_data) + 1:
+            console.print("\n[bold cyan]Custom Traffic Input (Plain English)[/bold cyan]")
+            console.print("[dim]Describe the traffic scenario in plain English:[/dim]")
+            console.print("[dim]Example: 'A SYN flood attack targeting port 80 with 500 connections'[/dim]")
+            console.print("[dim]Example: 'Normal HTTP browsing to a web server'[/dim]")
+            description = input("Describe traffic: ").strip()
+            if not description:
+                continue
+            if not gemini_model:
+                console.print("[red]Gemini API required for this feature. Set GEMINI_API_KEY.[/red]")
+                continue
+            with console.status("[cyan]Generating traffic features from description...[/cyan]"):
+                traffic_dict = generate_traffic_from_description(gemini_model, description)
+            if traffic_dict:
+                console.print("\n[green]Generated traffic features:[/green]")
+                for k, v in traffic_dict.items():
+                    console.print(f"  {k}: {v}")
+                confirm = input("\nUse these features? (y/n): ").strip().lower()
+                if confirm == 'y':
+                    base = predefined_data[0].copy()
+                    base.update(traffic_dict)
+                    test_df = pd.DataFrame([base])
+                    analyze_traffic(test_df, models, gemini_model, f"Custom: {description}", train_cols, base)
             else:
-                console.print(Panel(
-                    f"[bold green]✅ TRAFFIC APPEARS NORMAL[/bold green]\n"
-                    f"Consensus: {
-                        len(predictions_list)-attack_count}/{len(predictions_list)} models approve\n"
-                    f"Confidence: {(1-consensus)*100:.1f}%\n"
-                    f"Recommendation: Allow traffic, continue monitoring",
-                    style="bold white on green"
-                ))
+                console.print("[red]Failed to generate traffic features.[/red]")
 
-            # AI-powered explanation using Gemini
-            if gemini_model:
-                overall_pred = 1 if consensus >= 0.6 else 0
-                avg_conf = consensus if overall_pred == 1 else (1 - consensus)
-                console.print("\n[bold cyan]🤖 AI Analysis (Gemini):[/bold cyan]")
-                with console.status("[cyan]Getting AI explanation...[/cyan]"):
-                    explanation = explain_prediction_with_ai(
-                        gemini_model,
-                        scenario_descriptions[choice-1],
-                        overall_pred,
-                        avg_conf,
-                        predefined_data[choice-1]
-                    )
-                console.print(Panel(explanation, title="AI Security Analyst", border_style="magenta"))
-
-            console.print("="*60 + "\n")
+        elif 1 <= choice <= len(predefined_data):
+            test_df = pd.DataFrame([predefined_data[choice - 1]])
+            analyze_traffic(test_df, models, gemini_model, scenario_descriptions[choice-1], train_cols, predefined_data[choice-1])
 
         else:
-            console.print(
-                f"[red]Invalid choice. Please select 1-{len(predefined_data)} or 0 to exit.[/red]")
+            console.print(f"[red]Invalid choice.[/red]")
 
 
 if __name__ == "__main__":
