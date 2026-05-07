@@ -22,3 +22,4 @@ seaborn==0.13.2
 six==1.17.0
 threadpoolctl==3.6.0
 xgboost==3.2.0
+google-generativeai

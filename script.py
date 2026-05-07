@@ -1,4 +1,5 @@
 import warnings
+import os
 from rich.table import Table
 from rich.progress import Progress
 from rich.console import Console
@@ -6,6 +7,7 @@ from rich.panel import Panel
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
+import google.generativeai as genai
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score, precision_score, recall_score
 from xgboost import XGBClassifier
 from sklearn.neural_network import MLPClassifier
@@ -20,6 +22,53 @@ matplotlib.use('Agg')
 
 warnings.filterwarnings('ignore')
 console = Console()
+
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'YOUR_API_KEY_HERE')
+
+
+def init_gemini():
+    """Initialize Gemini API with gemini-3-flash-preview model."""
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model_name = "gemini-3-flash-preview"
+        console.print(f"[cyan]Initializing Gemini model: {model_name}[/cyan]")
+        return genai.GenerativeModel(model_name)
+    except Exception as e:
+        console.print(f"[yellow]Gemini API init failed: {e}[/yellow]")
+        return None
+
+
+def explain_prediction_with_ai(model, scenario_desc, prediction, confidence, traffic_data):
+    """Use Gemini API to explain the detection result in plain English."""
+    try:
+        if model is None:
+            return "AI explanation unavailable (API not configured)."
+
+        prompt = f"""
+You are a cybersecurity expert analyzing network intrusion detection results.
+
+Scenario: {scenario_desc}
+Prediction: {"ATTACK detected" if prediction == 1 else "Normal traffic"}
+Confidence: {confidence:.2%}
+
+Key traffic features:
+- Protocol: {traffic_data.get('protocol_type', 'N/A')}
+- Service: {traffic_data.get('service', 'N/A')}
+- Flag: {traffic_data.get('flag', 'N/A')}
+- Source bytes: {traffic_data.get('src_bytes', 'N/A')}
+- Destination bytes: {traffic_data.get('dst_bytes', 'N/A')}
+- Error rates: serror={traffic_data.get('serror_rate', 0):.2f}, rerror={traffic_data.get('rerror_rate', 0):.2f}
+- Count: {traffic_data.get('count', 'N/A')}
+
+Explain in 3-4 sentences:
+1. What this traffic pattern indicates
+2. Why the model made this prediction
+3. What action should be taken
+"""
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"AI explanation error: {e}"
 
 
 def preprocess(dataframe, is_train=True):
@@ -262,6 +311,12 @@ def prediction_cli():
     console.log(
         "[bold cyan]Loading models and preprocessors for prediction...[/bold cyan]")
 
+    gemini_model = init_gemini()
+    if gemini_model:
+        console.log("[green]✓ Gemini AI explanations enabled[/green]")
+    else:
+        console.log("[yellow]⚠ Gemini AI disabled (set GEMINI_API_KEY env var)[/yellow]")
+
     models = {
         "Decision Tree": joblib.load("decision_tree_model.pkl"),
         "Random Forest": joblib.load("random_forest_model.pkl"),
@@ -438,6 +493,22 @@ def prediction_cli():
                     f"Recommendation: Allow traffic, continue monitoring",
                     style="bold white on green"
                 ))
+
+            # AI-powered explanation using Gemini
+            if gemini_model:
+                overall_pred = 1 if consensus >= 0.6 else 0
+                avg_conf = consensus if overall_pred == 1 else (1 - consensus)
+                console.print("\n[bold cyan]🤖 AI Analysis (Gemini):[/bold cyan]")
+                with console.status("[cyan]Getting AI explanation...[/cyan]"):
+                    explanation = explain_prediction_with_ai(
+                        gemini_model,
+                        scenario_descriptions[choice-1],
+                        overall_pred,
+                        avg_conf,
+                        predefined_data[choice-1]
+                    )
+                console.print(Panel(explanation, title="AI Security Analyst", border_style="magenta"))
+
             console.print("="*60 + "\n")
 
         else:
